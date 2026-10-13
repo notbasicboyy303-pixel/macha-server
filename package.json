@@ -1,0 +1,9 @@
+{
+  "name": "meccha-camouflage-server",
+  "version": "1.0.0",
+  "description": "Multiplayer server for Meccha Camouflage (WebSocket, rooms, match state machine)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=16" },
+  "license": "MIT"
+}
