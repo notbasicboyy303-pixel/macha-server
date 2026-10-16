@@ -14,6 +14,7 @@ class Socket extends EventEmitter {
   constructor(sock) {
     super(); this.sock = sock; this.buf = Buffer.alloc(0); this.readyState = 1; this.frag = null;
     sock.on('data', d => { this.buf = Buffer.concat([this.buf, d]); try { this._parse(); } catch (e) { this.terminate(); } });
+    sock.on('end', () => { try { sock.destroy(); } catch (e) {} });   // http servers keep half-open sockets: treat FIN as a real disconnect
     sock.on('close', () => { if (this.readyState !== 3) { this.readyState = 3; this.emit('close'); } });
     sock.on('error', () => { try { sock.destroy(); } catch (e) {} });
     sock.setNoDelay(true);
@@ -76,6 +77,7 @@ const MAP_NAMES = ['Hide-and-Seek Mansion', 'Sewer', 'Backrooms', 'Indoor Countr
 const DEFAULTS = { mode: 'Basic', hunters: 1, hunterWait: 60, searchTime: 180, answerTime: 15, taunt: 40, showRank: true, map: 'Random', filters: { Monochrome: false, Horror: false, Mosaic: false } };
 const RESULT_TIME = 12, SELECT_TIME = 5, MAX_ROOMS = 500, MAX_PLAYERS = 24;
 
+const gHist = [];                     // last global chat lines
 const rooms = new Map();
 const clients = new Map();            // id -> player
 let nextId = 1;
@@ -214,12 +216,79 @@ wss.on('connection', (ws, req) => {
     if (typeof raw !== 'string') raw = raw.toString();
     if (raw.length > 8192) return; let m; try { m = JSON.parse(raw); } catch (e) { return; } if (!m || typeof m.t !== 'string') return;
     handle(p, m);
+    if (p.uid && (m.t === 'create' || m.t === 'join' || m.t === 'quick' || m.t === 'leave')) notifyFriends(p, { t: 'fpres', p: presence(p) });
   });
-  ws.on('close', () => { clearInterval(hb); clients.delete(p.id); removeFromRoom(p); });
+  ws.on('close', () => { clearInterval(hb); clients.delete(p.id); removeFromRoom(p); if (p.uid && byUid.get(p.uid) === p) { byUid.delete(p.uid); notifyFriends(p, { t: 'fpres', p: { uid: p.uid, name: p.name, online: false, room: '' } }); } });
   ws.on('error', () => {});
 });
+
+// ---------------- friends / presence / DMs (stateless: friend lists live in the players' browsers) ----------------
+const byUid = new Map();       // uid -> online player
+const owners = new Map();      // uid -> secret key (first claim wins, in memory)
+const pendingReq = new Map();  // uid -> [{ t:'freq'|'facc'|'frem', from, name, ts }]  delivered when that player comes online
+const UID_RE = /^[A-Z0-9]{6,12}$/;
+const uidOf = s => { s = String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); return UID_RE.test(s) ? s : ''; };
+function queueFor(uid, item) { const a = pendingReq.get(uid) || []; if (a.length >= 30) a.shift(); a.push(item); pendingReq.set(uid, a); }
+function presence(q) { return { uid: q.uid, name: q.name, online: true, room: q.room ? q.room.code : '' }; }
+function notifyFriends(p, msg) { byUid.forEach(q => { if (q !== p && q.friends && q.friends.has(p.uid)) send(q, msg); }); }
+function isFriendPair(a, b) { return a.friends && b.friends && a.friends.has(b.uid) && b.friends.has(a.uid); }
+function social(p, m) {
+  switch (m.t) {
+    case 'fhello': {
+      const uid = uidOf(m.uid), key = String(m.key || '').slice(0, 64);
+      if (!uid || key.length < 8) { send(p, { t: 'ferr', code: 'bad', msg: 'Bad friend id' }); return; }
+      if (owners.has(uid) && owners.get(uid) !== key) { send(p, { t: 'fclash' }); return; }
+      owners.set(uid, key);
+      if (p.uid && p.uid !== uid && byUid.get(p.uid) === p) byUid.delete(p.uid);
+      const old = byUid.get(uid); if (old && old !== p) { old.uid = ''; send(old, { t: 'fkick' }); }
+      p.uid = uid; byUid.set(uid, p); p.name = clean(m.name, 20) || p.name;
+      p.friends = new Set((Array.isArray(m.friends) ? m.friends : []).slice(0, 200).map(uidOf).filter(Boolean));
+      const on = []; p.friends.forEach(f => { const q = byUid.get(f); if (q) on.push(presence(q)); });
+      send(p, { t: 'fstatus', online: on });
+      const q = pendingReq.get(uid); if (q) { pendingReq.delete(uid); q.forEach(it => send(p, it)); }
+      notifyFriends(p, { t: 'fpres', p: presence(p) });
+      return;
+    }
+    case 'fsync': { if (!p.uid) return; p.friends = new Set((Array.isArray(m.friends) ? m.friends : []).slice(0, 200).map(uidOf).filter(Boolean));
+      const on = []; p.friends.forEach(f => { const q = byUid.get(f); if (q) on.push(presence(q)); }); send(p, { t: 'fstatus', online: on }); return; }
+    case 'freq': {
+      if (!p.uid) return; const to = uidOf(m.to);
+      if (!to || to === p.uid) { send(p, { t: 'fack', to: to, ok: false, msg: to === p.uid ? "That's your own code" : 'Invalid friend code' }); return; }
+      if (!owners.has(to) && !byUid.has(to)) { send(p, { t: 'fack', to: to, ok: false, msg: 'No player with that code (they must open the game once)' }); return; }
+      const item = { t: 'freq', from: p.uid, name: p.name, ts: Date.now() }, q = byUid.get(to);
+      if (q) send(q, item); else queueFor(to, item);
+      send(p, { t: 'fack', to: to, ok: true, queued: !q }); return;
+    }
+    case 'facc': {
+      if (!p.uid) return; const to = uidOf(m.to); if (!to) return;
+      if (p.friends) p.friends.add(to);
+      const item = { t: 'facc', from: p.uid, name: p.name, ts: Date.now() }, q = byUid.get(to);
+      if (q) { if (q.friends) q.friends.add(p.uid); send(q, item); send(q, { t: 'fpres', p: presence(p) }); } else queueFor(to, item);
+      if (q) send(p, { t: 'fpres', p: presence(q) }); return;
+    }
+    case 'frem': {
+      if (!p.uid) return; const to = uidOf(m.to); if (!to) return;
+      if (p.friends) p.friends.delete(to);
+      const q = byUid.get(to), item = { t: 'frem', from: p.uid, ts: Date.now() };
+      if (q) { if (q.friends) q.friends.delete(p.uid); send(q, item); } else queueFor(to, item); return;
+    }
+    case 'dm': {
+      if (!p.uid) return; const to = uidOf(m.to), txt = clean(m.text, 200); if (!to || !txt) return;
+      const now = Date.now(); if (now - (p.lastDm || 0) < 500) return; p.lastDm = now;
+      const q = byUid.get(to);
+      if (!q || !isFriendPair(p, q)) { send(p, { t: 'dmfail', to: to, msg: q ? 'You are not friends yet' : 'Friend is offline' }); return; }
+      send(q, { t: 'dm', from: p.uid, name: p.name, text: txt, ts: now }); return;
+    }
+    case 'finv': {
+      if (!p.uid || !p.room) return; const to = uidOf(m.to), q = byUid.get(to);
+      if (!q || !isFriendPair(p, q)) { send(p, { t: 'dmfail', to: to, msg: 'Friend is offline' }); return; }
+      send(q, { t: 'finv', from: p.uid, name: p.name, code: p.room.code, room: p.room.name, priv: !!p.room.pass }); return;
+    }
+  }
+}
 function findRoom(code) { return rooms.get(String(code || '').toUpperCase().trim()); }
 function handle(p, m) {
+  if (m.t.charCodeAt(0) === 102 || m.t === 'dm') { social(p, m); return; }   // f* (friends) and dm
   switch (m.t) {
     case 'hello': p.name = clean(m.name, 20) || p.name; break;
     case 'list': send(p, { t: 'rooms', rooms: [...rooms.values()].filter(r => r.players.size < r.max).map(r => ({ code: r.code, name: r.name, players: r.players.size, max: r.max, priv: r.priv, region: r.region, tags: r.tags, phase: r.phase })).slice(0, 100) }); break;
@@ -249,8 +318,11 @@ function handle(p, m) {
     case 'look': { const r = p.room; if (!r || !Array.isArray(m.parts) || m.parts.length > 12) return; p.look = m.parts.map(s => String(s).slice(0, 400)); bcast(r, { t: 'look', id: p.id, parts: p.look }, p); break; }
     case 'shoot': doShoot(p, m); break;
     case 'taunt': if (p.room) bcast(p.room, { t: 'taunt', id: p.id }, p); break;
-    case 'chat': { const txt = clean(m.text, 120); if (p.room && txt) bcast(p.room, { t: 'chat', id: p.id, name: p.name, text: txt }); break; }
+    case 'chat': { const txt = clean(m.text, 120); const nowc = Date.now(); if (nowc - (p.lastChat || 0) < 600) break; p.lastChat = nowc; if (p.room && txt) bcast(p.room, { t: 'chat', id: p.id, name: p.name, text: txt }); break; }
     case 'leave': removeFromRoom(p); send(p, { t: 'left' }); break;
+    case 'gchat': { const txt = clean(m.text, 140); const nw = Date.now(); if (!txt || nw - (p.lastG || 0) < 1500) break; p.lastG = nw;
+      const it = { t: 'gchat', name: p.name, uid: p.uid || '', text: txt, ts: nw }; gHist.push(it); if (gHist.length > 40) gHist.shift(); clients.forEach(q => send(q, it)); break; }
+    case 'ghist': send(p, { t: 'ghist', items: gHist.slice(-30) }); break;
     case 'ping': send(p, { t: 'pong', c: m.c }); break;
   }
 }
