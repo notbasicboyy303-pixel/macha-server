@@ -73,7 +73,7 @@ try { WebSocketServer = require('ws').WebSocketServer; } catch (e) { WebSocketSe
 const PORT = +process.env.PORT || 8080;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean); // e.g. https://www.crazygames.com,https://your-game.crazygames.com
 // keep in sync with MAPS in the game file
-const MAP_NAMES = ['Hide-and-Seek Mansion', 'Sewer', 'Backrooms', 'Indoor Country', 'Penguin Hotel', 'Osaka', 'Sugar Land', 'City', 'Minecraft'];
+const MAP_NAMES = ['Hide-and-Seek Mansion', 'Sewer', 'Backrooms', 'Indoor Country', 'Penguin Hotel', 'Osaka', 'Sugar Land', 'City', 'Minecraft', 'Museum'];
 const DEFAULTS = { mode: 'Basic', hunters: 1, hunterWait: 60, searchTime: 180, answerTime: 15, taunt: 40, showRank: true, map: 'Random', filters: { Monochrome: false, Horror: false, Mosaic: false } };
 const RESULT_TIME = 12, SELECT_TIME = 5, MAX_ROOMS = 500, MAX_PLAYERS = 24;
 
